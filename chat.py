@@ -1,136 +1,200 @@
 """
 Chat en la terminal con un modelo de lenguaje local usando Ollama.
 
-Conceptos que muestra este proyecto:
-  1. Cómo se llama a un LLM desde código (la API de chat).
-  2. El "historial": el modelo NO recuerda nada; cada vez le reenviamos
-     toda la conversación.
-  3. El "prompt de sistema": instrucciones que definen cómo se comporta.
-  4. Streaming: mostrar la respuesta palabra por palabra mientras se genera.
-  5. Métricas: tokens por segundo y tamaño del contexto.
+Toda la lógica (historial, memoria resumida, guardar/cargar) está en nucleo.py.
+Este archivo solo se encarga de leer lo que escribes y mostrar las respuestas.
 
 Uso:
-    python chat.py                 # usa el modelo por defecto
-    python chat.py --modelo qwen3:8b
+    python chat.py
+    python chat.py --modelo qwen3:4b --personalidad profesor
+    python chat.py --limite 800      # resume antes, para ver la memoria en acción
 """
 
 import argparse
-import json
-from datetime import datetime
-from pathlib import Path
 
-import ollama
 from rich.console import Console
 
-# "instruct" responde directo. La variante "qwen3:4b" (Thinking) siempre razona antes
-# de responder: es más lenta, pero útil para problemas de lógica o matemáticas.
-MODELO_POR_DEFECTO = "qwen3:4b-instruct"
-
-PROMPT_SISTEMA = (
-    "Eres un asistente útil y directo. Respondes siempre en español, "
-    "de forma clara y breve, salvo que el usuario pida más detalle."
-)
-
-CARPETA_CONVERSACIONES = Path(__file__).parent / "conversaciones"
+import nucleo
 
 AYUDA = """
 Comandos disponibles:
-  /ayuda     Muestra esta ayuda
-  /limpiar   Borra el historial (el modelo "olvida" la conversación)
-  /pensar    Activa/desactiva que el modelo muestre su razonamiento
-  /guardar   Guarda la conversación en un archivo JSON
-  /info      Muestra cuántos mensajes hay en el historial
-  /salir     Termina el programa
+  /ayuda                 Muestra esta ayuda
+  /limpiar               Borra la conversación y la memoria
+  /pensar                Activa/desactiva el razonamiento visible (modelos que razonan)
+  /personalidad          Lista las personalidades disponibles
+  /personalidad NOMBRE   Cambia de personalidad sin borrar la conversación
+  /memoria               Muestra el resumen guardado y los tokens usados
+  /resumir               Fuerza un resumen de la conversación ahora
+  /guardar               Guarda la conversación en un archivo JSON
+  /cargar                Lista las conversaciones guardadas
+  /cargar NÚMERO         Retoma una conversación guardada
+  /info                  Muestra modelo, personalidad y tamaño del historial
+  /salir                 Termina el programa
 """
 
 consola = Console()
 
 
-def historial_inicial() -> list[dict]:
-    """El historial siempre empieza con el mensaje de sistema."""
-    return [{"role": "system", "content": PROMPT_SISTEMA}]
-
-
-def guardar_conversacion(historial: list[dict], modelo: str) -> Path:
-    """Guarda el historial en conversaciones/AAAA-MM-DD_HH-MM-SS.json."""
-    CARPETA_CONVERSACIONES.mkdir(exist_ok=True)
-    nombre = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".json"
-    ruta = CARPETA_CONVERSACIONES / nombre
-    datos = {"modelo": modelo, "mensajes": historial}
-    ruta.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
-    return ruta
-
-
-def responder(modelo: str, historial: list[dict], pensar: bool) -> str:
-    """
-    Envía TODO el historial al modelo y muestra la respuesta en streaming.
-    Devuelve el texto completo de la respuesta para agregarlo al historial.
-    """
-    respuesta = ""
-    mostrando_razonamiento = False
-    ultimo = None
-
-    # stream=True devuelve la respuesta en pedazos ("chunks") a medida que se genera.
-    # think controla si los modelos que razonan (como Qwen3) piensan antes de responder.
-    for pedazo in ollama.chat(model=modelo, messages=historial, stream=True, think=pensar):
-        mensaje = pedazo.message
-
-        # El razonamiento llega por un canal separado de la respuesta final.
-        if pensar and mensaje.thinking:
-            if not mostrando_razonamiento:
+def mostrar_respuesta(conversacion: nucleo.Conversacion, texto: str, pensar: bool) -> None:
+    """Muestra la respuesta en streaming, con el razonamiento en gris."""
+    consola.print("[bold magenta]IA:[/] ", end="")
+    pensando = False
+    for fragmento in conversacion.enviar(texto, pensar=pensar):
+        if fragmento.tipo == "razonamiento":
+            if not pensando:
                 consola.print("[dim italic](pensando...)[/]")
-                mostrando_razonamiento = True
-            consola.print(mensaje.thinking, end="", style="dim", markup=False, highlight=False)
-
-        if mensaje.content:
-            if mostrando_razonamiento:
+                pensando = True
+            consola.print(fragmento.texto, end="", style="dim", markup=False, highlight=False)
+        else:
+            if pensando:
                 consola.print("\n")
-                mostrando_razonamiento = False
-            consola.print(mensaje.content, end="", markup=False, highlight=False)
-            respuesta += mensaje.content
-
-        ultimo = pedazo
-
+                pensando = False
+            consola.print(fragmento.texto, end="", markup=False, highlight=False)
     consola.print()
 
-    # El último pedazo trae estadísticas: tokens generados, tiempo, tamaño del contexto.
-    if ultimo is not None and ultimo.eval_count and ultimo.eval_duration:
-        velocidad = ultimo.eval_count / (ultimo.eval_duration / 1e9)
-        contexto = (ultimo.prompt_eval_count or 0) + ultimo.eval_count
+    est = conversacion.ultimas_estadisticas
+    if est:
         consola.print(
-            f"[dim]{ultimo.eval_count} tokens · {velocidad:.1f} tokens/s · "
-            f"contexto usado: ~{contexto} tokens[/]"
+            f"[dim]{est.tokens_generados} tokens · {est.tokens_por_segundo:.1f} tokens/s · "
+            f"contexto: ~{est.tokens_contexto} tokens (límite para resumir: {conversacion.limite_tokens})[/]"
         )
 
-    # Algunos modelos "filtran" su razonamiento dentro de la respuesta, terminado en </think>.
-    # Lo quitamos antes de guardarlo en el historial para no gastar contexto en él.
-    if "</think>" in respuesta:
-        respuesta = respuesta.split("</think>", 1)[1].strip()
 
-    return respuesta
+def resumir_con_aviso(conversacion: nucleo.Conversacion) -> None:
+    antes = conversacion.tokens_estimados()
+    with consola.status("Resumiendo la memoria..."):
+        conversacion.resumir()
+    despues = conversacion.tokens_estimados()
+    consola.print(
+        f"[yellow]Memoria resumida: ~{antes} → ~{despues} tokens "
+        f"(se conservan los últimos {conversacion.mensajes_recientes} mensajes completos).[/]"
+    )
+
+
+def ejecutar_comando(entrada: str, conversacion: nucleo.Conversacion, estado: dict):
+    """
+    Procesa un comando que empieza con '/'.
+    Devuelve la conversación (puede ser otra si se cargó una guardada) o None para salir.
+    """
+    partes = entrada.split(maxsplit=1)
+    comando = partes[0].lower()
+    argumento = partes[1].strip() if len(partes) > 1 else ""
+
+    if comando == "/salir":
+        return None
+
+    if comando == "/ayuda":
+        consola.print(AYUDA)
+
+    elif comando == "/limpiar":
+        conversacion.limpiar()
+        consola.print("[yellow]Conversación y memoria borradas.[/]")
+
+    elif comando == "/pensar":
+        estado["pensar"] = not estado["pensar"]
+        consola.print(f"[yellow]Razonamiento {'activado' if estado['pensar'] else 'desactivado'}.[/]")
+        if estado["pensar"] and "instruct" in conversacion.modelo:
+            consola.print("[dim]Nota: los modelos 'instruct' no razonan. Prueba con --modelo qwen3:4b[/]")
+
+    elif comando == "/personalidad":
+        if not argumento:
+            for nombre in nucleo.listar_personalidades():
+                marca = " (actual)" if nombre == conversacion.personalidad else ""
+                consola.print(f"  - {nombre}{marca}")
+            consola.print("[dim]Uso: /personalidad NOMBRE[/]")
+        else:
+            try:
+                conversacion.cambiar_personalidad(argumento)
+                consola.print(f"[yellow]Personalidad cambiada a '{argumento}'.[/]")
+            except ValueError as error:
+                consola.print(f"[red]{error}[/]")
+
+    elif comando == "/memoria":
+        consola.print(f"[yellow]Tokens enviados al modelo: ~{conversacion.tokens_estimados()} "
+                      f"(se resume al pasar de {conversacion.limite_tokens})[/]")
+        consola.print(f"[yellow]Veces resumida: {conversacion.veces_resumida}[/]")
+        if conversacion.resumen:
+            consola.print("[bold]Resumen guardado:[/]")
+            consola.print(conversacion.resumen, markup=False, highlight=False)
+        else:
+            consola.print("[dim]Todavía no hay resumen.[/]")
+
+    elif comando == "/resumir":
+        if len(conversacion.mensajes) <= conversacion.mensajes_recientes:
+            consola.print(f"[yellow]Hay muy pocos mensajes para resumir "
+                          f"(se conservan siempre los últimos {conversacion.mensajes_recientes}).[/]")
+        else:
+            resumir_con_aviso(conversacion)
+
+    elif comando == "/guardar":
+        ruta = conversacion.guardar()
+        consola.print(f"[yellow]Conversación guardada en {ruta.name}[/]")
+
+    elif comando == "/cargar":
+        guardadas = nucleo.listar_conversaciones()
+        if not guardadas:
+            consola.print("[yellow]No hay conversaciones guardadas.[/]")
+        elif not argumento:
+            for i, ruta in enumerate(guardadas, start=1):
+                consola.print(f"  {i}. {ruta.stem}")
+            consola.print("[dim]Uso: /cargar NÚMERO[/]")
+        elif argumento.isdigit() and 1 <= int(argumento) <= len(guardadas):
+            ruta = guardadas[int(argumento) - 1]
+            nueva = nucleo.Conversacion.cargar(
+                ruta,
+                limite_tokens=conversacion.limite_tokens,
+                mensajes_recientes=conversacion.mensajes_recientes,
+            )
+            consola.print(f"[yellow]Conversación '{ruta.stem}' cargada "
+                          f"({len(nueva.mensajes)} mensajes, modelo {nueva.modelo}).[/]")
+            return nueva
+        else:
+            consola.print("[red]Número no válido.[/] Escribe /cargar para ver la lista.")
+
+    elif comando == "/info":
+        consola.print(f"[yellow]Modelo: {conversacion.modelo} · Personalidad: {conversacion.personalidad} · "
+                      f"Mensajes recientes: {len(conversacion.mensajes)} · "
+                      f"Razonamiento: {'sí' if estado['pensar'] else 'no'}[/]")
+
+    else:
+        consola.print("[red]Comando desconocido.[/] Escribe /ayuda")
+
+    return conversacion
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Chat local con Ollama")
-    parser.add_argument("--modelo", default=MODELO_POR_DEFECTO, help="Modelo de Ollama a usar")
+    parser.add_argument("--modelo", default=nucleo.MODELO_POR_DEFECTO, help="Modelo de Ollama a usar")
+    parser.add_argument("--personalidad", default=nucleo.PERSONALIDAD_POR_DEFECTO,
+                        help="Archivo de la carpeta personalidades/ (sin .md)")
+    parser.add_argument("--limite", type=int, default=nucleo.LIMITE_TOKENS,
+                        help="Tokens a partir de los cuales se resume la memoria")
     args = parser.parse_args()
-    modelo = args.modelo
 
     # Comprobamos que Ollama esté corriendo y que el modelo exista.
     try:
-        disponibles = [m.model for m in ollama.list().models]
+        disponibles = nucleo.listar_modelos()
     except Exception:
         consola.print("[red]No pude conectar con Ollama.[/] Abre la app de Ollama o ejecuta: ollama serve")
         return
-    if modelo not in disponibles:
-        consola.print(f"[red]El modelo '{modelo}' no está descargado.[/] Ejecuta: ollama pull {modelo}")
+    if args.modelo not in disponibles:
+        consola.print(f"[red]El modelo '{args.modelo}' no está descargado.[/] Ejecuta: ollama pull {args.modelo}")
         consola.print(f"Modelos disponibles: {', '.join(disponibles) or '(ninguno)'}")
         return
 
-    historial = historial_inicial()
-    pensar = False
+    try:
+        conversacion = nucleo.Conversacion(
+            modelo=args.modelo, personalidad=args.personalidad, limite_tokens=args.limite
+        )
+    except ValueError as error:
+        consola.print(f"[red]{error}[/]")
+        return
 
-    consola.print(f"[bold green]Chat local con {modelo}[/]  (escribe /ayuda para ver los comandos)\n")
+    estado = {"pensar": False}
+    consola.print(
+        f"[bold green]Chat local con {conversacion.modelo}[/] · personalidad: {conversacion.personalidad}  "
+        f"(escribe /ayuda para ver los comandos)\n"
+    )
 
     while True:
         try:
@@ -142,44 +206,25 @@ def main() -> None:
         if not entrada:
             continue
 
-        # --- Comandos ---
         if entrada.startswith("/"):
-            comando = entrada.lower()
-            if comando == "/salir":
+            conversacion = ejecutar_comando(entrada, conversacion, estado)
+            if conversacion is None:
                 consola.print("¡Hasta luego!")
                 break
-            elif comando == "/ayuda":
-                consola.print(AYUDA)
-            elif comando == "/limpiar":
-                historial = historial_inicial()
-                consola.print("[yellow]Historial borrado.[/]")
-            elif comando == "/pensar":
-                pensar = not pensar
-                consola.print(f"[yellow]Razonamiento {'activado' if pensar else 'desactivado'}.[/]")
-            elif comando == "/guardar":
-                ruta = guardar_conversacion(historial, modelo)
-                consola.print(f"[yellow]Conversación guardada en {ruta}[/]")
-            elif comando == "/info":
-                consola.print(f"[yellow]Mensajes en el historial: {len(historial)} (incluye el de sistema)[/]")
-            else:
-                consola.print("[red]Comando desconocido.[/] Escribe /ayuda")
             continue
 
-        # --- Conversación ---
-        historial.append({"role": "user", "content": entrada})
-        consola.print("[bold magenta]IA:[/] ", end="")
         try:
-            respuesta = responder(modelo, historial, pensar)
+            mostrar_respuesta(conversacion, entrada, estado["pensar"])
         except KeyboardInterrupt:
             consola.print("\n[yellow]Respuesta interrumpida.[/]")
-            historial.pop()  # quitamos la pregunta sin respuesta
             continue
         except Exception as error:
             consola.print(f"\n[red]Error al hablar con el modelo:[/] {error}")
-            historial.pop()
             continue
 
-        historial.append({"role": "assistant", "content": respuesta})
+        # Después de cada respuesta revisamos si la memoria creció demasiado.
+        if conversacion.necesita_resumen():
+            resumir_con_aviso(conversacion)
         consola.print()
 
 
