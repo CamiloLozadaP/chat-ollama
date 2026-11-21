@@ -1,0 +1,12 @@
+# Entorno virtual de Python
+.venv/
+
+# Archivos generados por Python
+__pycache__/
+*.pyc
+
+# Conversaciones guardadas (pueden tener información personal)
+conversaciones/
+
+# Variables de entorno y claves
+.env
